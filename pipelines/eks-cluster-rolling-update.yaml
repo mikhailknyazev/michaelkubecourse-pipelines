@@ -1,0 +1,73 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: wf-upd
+  namespace: litmus
+spec:
+  entrypoint: argowf-chaos
+  serviceAccountName: argo-chaos
+  arguments:
+    parameters:
+      - name: appNamespace
+        value: "apps"
+      - name: adminModeNamespace
+        value: "litmus"
+      - name: appLabel
+        value: "basic"
+      - name: benchmark-duration
+        value: "12m"
+
+  nodeSelector:
+    kubernetes.io/os: linux
+    role: "tools"
+
+  tolerations:
+    - key: tools
+      operator: "Equal"
+      value: "true"
+      effect: NoSchedule
+
+  templates:
+    - name: argowf-chaos
+      dag:
+        tasks:
+
+          - name: cluster-autoscaler-log-daemon
+            templateRef:
+              name: step5-templates
+              template: cluster-autoscaler-log-daemon
+
+          - name: get-ingress-alb-workload-url
+            templateRef:
+              name: step6-templates
+              template: get-ingress-alb-workload-url
+
+          - name: benchmark
+            dependencies: [ get-ingress-alb-workload-url ]
+            templateRef:
+              name: step3-templates
+              template: run-benchmark
+            arguments:
+              parameters:
+                - name: bench-duration
+                  value: "{{workflow.parameters.benchmark-duration}}"
+                - name: bench-rate
+                  value: "10"
+                - name: target-url
+                  value: "{{tasks.get-ingress-alb-workload-url.outputs.result}}/hello?myName=MichaelK"
+
+          - name: eks-rolling-update-experiment
+            dependencies: [ get-ingress-alb-workload-url ]
+            templateRef:
+              name: step10-templates
+              template: eks-rolling-update-experiment
+
+          - name: benchmark-reliability-verdict
+            dependencies: [ eks-rolling-update-experiment, benchmark ]
+            templateRef:
+              name: step3-templates
+              template: benchmark-reliability-verdict
+            arguments:
+              parameters:
+                - name: benchmark-result
+                  value: '{{tasks.benchmark.outputs.result}}'

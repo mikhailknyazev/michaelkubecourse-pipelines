@@ -1,0 +1,154 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: wf-trm-con
+  namespace: litmus
+spec:
+  entrypoint: argowf-chaos
+  serviceAccountName: argo-chaos
+  arguments:
+    parameters:
+      - name: appNamespace
+        value: "apps"
+      - name: adminModeNamespace
+        value: "litmus"
+      - name: appLabel
+        value: "basic"
+
+      - name: chaos-duration
+        value: "240"
+
+      - name: litmus-experiment-id
+        value: "ec-trm-con"
+
+      - name: benchmark-duration
+        value: "480s"
+
+  nodeSelector:
+    kubernetes.io/os: linux
+    role: "tools"
+
+  tolerations:
+    - key: tools
+      operator: "Equal"
+      value: "true"
+      effect: NoSchedule
+
+  templates:
+    - name: argowf-chaos
+      dag:
+        tasks:
+
+          # We are querying the EC2 metadata service of the current Kubernetes node for the AWS Region name
+          - name: get-current-region
+            templateRef:
+              name: step2-templates
+              template: cmd
+            arguments:
+              parameters:
+                - name: cmd
+                  value: >-
+                    curl --silent http://169.254.169.254/latest/dynamic/instance-identity/document | jq -r .region
+
+          # We are running the benchmark in parallel with the chaos experiment "chaos-1-ec2-term-Continuous"
+          - name: benchmark
+            dependencies: [ get-current-region ]
+            templateRef:
+              name: step3-templates
+              template: run-benchmark
+            arguments:
+              parameters:
+                - name: bench-duration
+                  value: "{{workflow.parameters.benchmark-duration}}"
+                - name: bench-rate
+                  value: "10"
+                - name: target-url
+                  value: "http://{{workflow.parameters.appLabel}}.{{workflow.parameters.appNamespace}}.svc.cluster.local:8080/hello"
+
+          # 1 EC2 instance terminate (among 1 or 2 ones): Continuous Test
+
+          - name: chaos-1-ec2-term-Continuous
+            dependencies: [ get-current-region ]
+            templateRef:
+              name: step2-templates
+              template: litmus-terminate-ec2
+            arguments:
+              parameters:
+                - name: chaos-duration
+                  value: "{{workflow.parameters.chaos-duration}}"
+                - name: chaos-interval
+                  value: "{{workflow.parameters.chaos-duration}}"
+                - name: probe-mode
+                  value: "Continuous"
+                - name: experiment-id
+                  value: "{{workflow.parameters.litmus-experiment-id}}"
+                - name: ec2-instance-tag
+                  value: "Name:kube-system-ec2-eks_asg"
+                - name: region
+                  value: "{{tasks.get-current-region.outputs.result}}"
+                - name: http-probe-url
+                  value: "http://{{workflow.parameters.appLabel}}.{{workflow.parameters.appNamespace}}.svc.cluster.local:8080/hello"
+
+          - name: wait-1-ec2-term-Continuous
+            dependencies: [ chaos-1-ec2-term-Continuous ]
+            templateRef:
+              name: step1-templates
+              template: await-litmus-result
+            arguments:
+              parameters:
+                - name: experiment-id
+                  value: "{{workflow.parameters.litmus-experiment-id}}"
+
+          - name: litmus-intermediate-verdict
+            dependencies: [ wait-1-ec2-term-Continuous ]
+            templateRef:
+              name: step1-templates
+              template: litmus-reliability-verdict
+            arguments:
+              parameters:
+                - name: experiment-id
+                  value: "{{workflow.parameters.litmus-experiment-id}}"
+
+          - name: benchmark-intermediate-verdict
+            dependencies: [ wait-1-ec2-term-Continuous, benchmark ]
+            templateRef:
+              name: step3-templates
+              template: benchmark-reliability-verdict
+            arguments:
+              parameters:
+                - name: benchmark-result
+                  value: '{{tasks.benchmark.outputs.result}}'
+
+          # // TODO MKN: investigate cases when Litmus "Continuous" Probe is Ok, but success from the benchmark is NOT 100% ...
+          - name: reliability-verdict
+            dependencies: [ litmus-intermediate-verdict, benchmark-intermediate-verdict ]
+            templateRef:
+              name: step1-templates
+              template: reliability-verdict
+            arguments:
+              parameters:
+                - name: script
+                  value: |
+                    #!/bin/sh
+                    set -e
+
+                    echo '*******************************************************************************************************************************************'
+                    echo 'We are ignoring the Benchmark Results / verdict for now (we can analyse it here more and decide in terms of the overall success):'
+                    echo '{{tasks.benchmark.outputs.result}}'
+
+                    benchmark_intermediate_verdict='{{tasks.benchmark-intermediate-verdict.outputs.parameters.verdict}}'
+                    echo "benchmark_intermediate_verdict: ${benchmark_intermediate_verdict}"
+
+                    echo 'We are only counting the litmus_experiment_verdict for now to decide on the overall success:'
+                    litmus_experiment_verdict='{{tasks.litmus-intermediate-verdict.outputs.parameters.verdict}}'
+                    echo "litmus_experiment_verdict: ${litmus_experiment_verdict}"
+
+                    echo '*******************************************************************************************************************************************'
+                    if [ "${litmus_experiment_verdict}" = "RELIABILITY_OK" ]
+                    then
+                      echo "RELIABILITY_OK"
+                    else
+                      echo "Reliability is not good enough"
+                    fi
+
+                    exit 0

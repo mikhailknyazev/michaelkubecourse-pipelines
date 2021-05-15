@@ -1,2 +1,2 @@
-# jenkins-chaos-workflows
-Jenkins with Chaos Workflows
+# michaelkubecourse-pipelines
+Pipelines for course "Configuring Kubernetes for Reliability with LitmusChaos"

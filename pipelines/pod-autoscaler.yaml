@@ -1,0 +1,146 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: wf-scl
+  namespace: litmus
+spec:
+  entrypoint: argowf-chaos
+  serviceAccountName: argo-chaos
+  arguments:
+    parameters:
+      - name: appNamespace
+        value: "apps"
+      - name: adminModeNamespace
+        value: "litmus"
+      - name: appLabel
+        value: "basic"
+
+      - name: chaos-duration
+        value: "390" # 6 minutes and 30 seconds
+
+      - name: chaos-replica-count
+        value: "6"
+
+      - name: check-all-running-after-sec-of-scaled-out-state
+        value: "50" # 50 seconds
+
+      - name: litmus-experiment-id
+        value: "scaler"
+
+  nodeSelector:
+    kubernetes.io/os: linux
+    role: "tools"
+
+  tolerations:
+    - key: tools
+      operator: "Equal"
+      value: "true"
+      effect: NoSchedule
+
+  # Note: it is for Step 5 ("Litmus cluster-autoscaler experiment" + "CA enabled")
+
+  templates:
+    - name: argowf-chaos
+      dag:
+        tasks:
+
+          - name: cluster-autoscaler-log-daemon
+            templateRef:
+              name: step5-templates
+              template: cluster-autoscaler-log-daemon
+
+          - name: nodes-count-before-scale-out
+            templateRef:
+              name: step4-templates
+              template: count-workload-nodes
+
+          # Add stress number replicas of an App: Continuous Test
+
+          - name: chaos-pod-autoscaler
+            dependencies: [ nodes-count-before-scale-out ]
+            templateRef:
+              name: step5-templates
+              template: litmus-pod-autoscaler
+            arguments:
+              parameters:
+                - name: chaos-duration
+                  value: "{{workflow.parameters.chaos-duration}}"
+                - name: replica-count
+                  value: "{{workflow.parameters.chaos-replica-count}}"
+                - name: check-all-running-after-sec-of-chaos
+                  value: "{{workflow.parameters.check-all-running-after-sec-of-scaled-out-state}}"
+                - name: http-probe-mode
+                  value: "Continuous"
+                - name: experiment-id
+                  value: "{{workflow.parameters.litmus-experiment-id}}"
+                - name: http-probe-url
+                  value: "http://{{workflow.parameters.appLabel}}.{{workflow.parameters.appNamespace}}.svc.cluster.local:8080/hello"
+
+          - name: wait-pod-autoscaler
+            dependencies: [ chaos-pod-autoscaler ]
+            templateRef:
+              name: step1-templates
+              template: await-litmus-result
+            arguments:
+              parameters:
+                - name: experiment-id
+                  value: "{{workflow.parameters.litmus-experiment-id}}"
+
+          - name: nodes-count-after-scale-out
+            dependencies: [ wait-pod-autoscaler ]
+            templateRef:
+              name: step4-templates
+              template: count-workload-nodes
+
+          # // TODO MKN: docu: related to the following settings in .../course/config/helm/values/cluster-autoscaler.yaml
+          #    scale-down-unneeded-time: 1m
+          #    scale-down-delay-after-add: 1m
+          - name: let-cluster-autoscaler-scale-in
+            dependencies: [ nodes-count-after-scale-out ]
+            templateRef:
+              name: step5-templates
+              template: pause
+            arguments:
+              parameters:
+                - name: duration
+                  value: "3m"
+
+          - name: nodes-count-after-scale-in
+            dependencies: [ let-cluster-autoscaler-scale-in ]
+            templateRef:
+              name: step4-templates
+              template: count-workload-nodes
+
+          - name: litmus-intermediate-verdict
+            dependencies: [ wait-pod-autoscaler ]
+            templateRef:
+              name: step1-templates
+              template: litmus-reliability-verdict
+            arguments:
+              parameters:
+                - name: experiment-id
+                  value: "{{workflow.parameters.litmus-experiment-id}}"
+
+          - name: nodes-scaling-intermediate-verdict
+            dependencies: [ nodes-count-after-scale-in ]
+            templateRef:
+              name: step5-templates
+              template: nodes-scaling-reliability-verdict
+            arguments:
+              parameters:
+                - name: nodes-count-before-scale-out
+                  value: '{{tasks.nodes-count-before-scale-out.outputs.result}}'
+                - name: nodes-count-after-scale-out
+                  value: '{{tasks.nodes-count-after-scale-out.outputs.result}}'
+                - name: nodes-count-after-scale-in
+                  value: '{{tasks.nodes-count-after-scale-in.outputs.result}}'
+
+          - name: overall-reliability-verdict
+            dependencies: [ nodes-scaling-intermediate-verdict, litmus-intermediate-verdict ]
+            templateRef:
+              name: step5-templates
+              template: composite-reliability-verdict
+            arguments:
+              parameters:
+                - name: upstream-verdicts
+                  value: '{{tasks.litmus-intermediate-verdict.outputs.parameters.verdict}},{{tasks.nodes-scaling-intermediate-verdict.outputs.parameters.verdict}}'

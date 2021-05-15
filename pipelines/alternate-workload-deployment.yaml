@@ -1,0 +1,80 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: wf-dpl
+  namespace: litmus
+spec:
+  entrypoint: argowf-chaos
+  serviceAccountName: argo-chaos
+  arguments:
+    parameters:
+      - name: appNamespace
+        value: "apps"
+      - name: adminModeNamespace
+        value: "litmus"
+      - name: appLabel
+        value: "basic"
+      - name: duration
+        value: "90s"
+
+  nodeSelector:
+    kubernetes.io/os: linux
+    role: "tools"
+
+  tolerations:
+    - key: tools
+      operator: "Equal"
+      value: "true"
+      effect: NoSchedule
+
+  # Note: it is for Step 6 (Use Ingress/ALB-based URL to "hello" from "k describe ingress -n apps basic")
+
+  templates:
+    - name: argowf-chaos
+      dag:
+        tasks:
+
+          - name: cluster-autoscaler-log-daemon
+            templateRef:
+              name: step5-templates
+              template: cluster-autoscaler-log-daemon
+
+          - name: get-ingress-alb-workload-url
+            templateRef:
+              name: step6-templates
+              template: get-ingress-alb-workload-url
+
+          # Redeploy Helm chart (Deployment - Rolling update)
+          - name: alternate-workload-deployment
+            dependencies: [ get-ingress-alb-workload-url ]
+            templateRef:
+              name: step6-templates
+              template: deploy-previous-chart-version
+            arguments:
+              parameters:
+                - name: timeout
+                  value: "{{workflow.parameters.duration}}"
+
+          - name: benchmark
+            dependencies: [ get-ingress-alb-workload-url ]
+            templateRef:
+              name: step3-templates
+              template: run-benchmark
+            arguments:
+              parameters:
+                - name: bench-duration
+                  value: "{{workflow.parameters.duration}}"
+                - name: bench-rate
+                  value: "10"
+                - name: target-url
+                  value: "{{tasks.get-ingress-alb-workload-url.outputs.result}}/hello?myName=MichaelK"
+
+          - name: benchmark-reliability-verdict
+            dependencies: [ alternate-workload-deployment, benchmark ]
+            templateRef:
+              name: step3-templates
+              template: benchmark-reliability-verdict
+            arguments:
+              parameters:
+                - name: benchmark-result
+                  value: '{{tasks.benchmark.outputs.result}}'

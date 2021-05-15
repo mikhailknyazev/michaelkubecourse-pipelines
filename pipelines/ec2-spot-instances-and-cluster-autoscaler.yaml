@@ -1,0 +1,189 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: wf-spt-scl
+  namespace: litmus
+spec:
+  entrypoint: argowf-chaos
+  serviceAccountName: argo-chaos
+  arguments:
+    parameters:
+      - name: appNamespace
+        value: "apps"
+      - name: adminModeNamespace
+        value: "litmus"
+      - name: appLabel
+        value: "basic"
+
+      - name: benchmark-duration
+        value: "11m"
+
+      - name: chaos-duration
+        value: "390" # 6 minutes and 30 seconds
+
+      - name: chaos-replica-count
+        value: "5"
+
+      - name: check-all-running-after-sec-of-scaled-out-state
+        value: "50" # 50 seconds
+
+      - name: litmus-experiment-id
+        value: "scaler-spt"
+
+  nodeSelector:
+    kubernetes.io/os: linux
+    role: "tools"
+
+  tolerations:
+    - key: tools
+      operator: "Equal"
+      value: "true"
+      effect: NoSchedule
+
+  # Note: For Step 7 ("Litmus cluster-autoscaler experiment" + "CA enabled" + 2 Spot Instances ASG-s)
+  #               SHOW STUDENTS: CA
+  # I0508 11:27:27.601270       1 scale_up.go:456] Best option to resize: kube-spot-secondary2021050810395203820000000b
+  # I0508 11:27:27.601290       1 scale_up.go:460] Estimated 3 nodes needed in kube-spot-secondary2021050810395203820000000b
+  # I0508 11:27:27.601366       1 scale_up.go:566] Splitting scale-up between 2 similar node groups: {kube-spot-secondary202105081039
+  # 5203820000000b, kube-spot-primary2021050810395203780000000a}
+  # I0508 11:27:27.601389       1 scale_up.go:574] Final scale-up plan: [{kube-spot-secondary2021050810395203820000000b 1->3 (max: 5)
+  # } {kube-spot-primary2021050810395203780000000a 1->2 (max: 5)}]
+  # I0508 11:27:27.601408       1 scale_up.go:663] Scale-up: setting group kube-spot-secondary2021050810395203820000000b size to 3
+  # I0508 11:27:27.601444       1 auto_scaling_groups.go:219] Setting asg kube-spot-secondary2021050810395203820000000b size to 3
+  # I0508 11:27:27.763368       1 scale_up.go:663] Scale-up: setting group kube-spot-primary2021050810395203780000000a size to 2
+  # I0508 11:27:27.763394       1 auto_scaling_groups.go:219] Setting asg kube-spot-primary2021050810395203780000000a size to 2
+
+  templates:
+    - name: argowf-chaos
+      dag:
+        tasks:
+
+          - name: cluster-autoscaler-log-daemon
+            templateRef:
+              name: step5-templates
+              template: cluster-autoscaler-log-daemon
+
+          - name: nodes-count-before-scale-out
+            templateRef:
+              name: step4-templates
+              template: count-workload-nodes
+
+          - name: get-ingress-alb-workload-url
+            templateRef:
+              name: step6-templates
+              template: get-ingress-alb-workload-url
+
+          - name: benchmark
+            dependencies: [ get-ingress-alb-workload-url ]
+            templateRef:
+              name: step3-templates
+              template: run-benchmark
+            arguments:
+              parameters:
+                - name: bench-duration
+                  value: "{{workflow.parameters.benchmark-duration}}"
+                - name: bench-rate
+                  value: "10"
+                - name: target-url
+                  value: "{{tasks.get-ingress-alb-workload-url.outputs.result}}/hello?myName=MichaelK"
+
+          # Add stress number replicas of an App: Continuous Test
+
+          - name: chaos-pod-autoscaler
+            dependencies: [ nodes-count-before-scale-out, get-ingress-alb-workload-url ]
+            templateRef:
+              name: step5-templates
+              template: litmus-pod-autoscaler
+            arguments:
+              parameters:
+                - name: chaos-duration
+                  value: "{{workflow.parameters.chaos-duration}}"
+                - name: replica-count
+                  value: "{{workflow.parameters.chaos-replica-count}}"
+                - name: check-all-running-after-sec-of-chaos
+                  value: "{{workflow.parameters.check-all-running-after-sec-of-scaled-out-state}}"
+                - name: http-probe-mode
+                  value: "Continuous"
+                - name: experiment-id
+                  value: "{{workflow.parameters.litmus-experiment-id}}"
+                - name: http-probe-url
+                  value: "{{tasks.get-ingress-alb-workload-url.outputs.result}}/hello"
+
+          - name: wait-pod-autoscaler
+            dependencies: [ chaos-pod-autoscaler ]
+            templateRef:
+              name: step1-templates
+              template: await-litmus-result
+            arguments:
+              parameters:
+                - name: experiment-id
+                  value: "{{workflow.parameters.litmus-experiment-id}}"
+
+          - name: nodes-count-after-scale-out
+            dependencies: [ wait-pod-autoscaler ]
+            templateRef:
+              name: step4-templates
+              template: count-workload-nodes
+
+          # // TODO MKN: docu: related to the following settings in .../course/config/helm/values/cluster-autoscaler.yaml
+          #    scale-down-unneeded-time: 1m
+          #    scale-down-delay-after-add: 1m
+          - name: let-cluster-autoscaler-scale-in
+            dependencies: [ nodes-count-after-scale-out ]
+            templateRef:
+              name: step5-templates
+              template: pause
+            arguments:
+              parameters:
+                - name: duration
+                  value: "3m"
+
+          - name: nodes-count-after-scale-in
+            dependencies: [ let-cluster-autoscaler-scale-in ]
+            templateRef:
+              name: step4-templates
+              template: count-workload-nodes
+
+          - name: nodes-scaling-intermediate-verdict
+            dependencies: [ nodes-count-after-scale-in ]
+            templateRef:
+              name: step5-templates
+              template: nodes-scaling-reliability-verdict
+            arguments:
+              parameters:
+                - name: nodes-count-before-scale-out
+                  value: '{{tasks.nodes-count-before-scale-out.outputs.result}}'
+                - name: nodes-count-after-scale-out
+                  value: '{{tasks.nodes-count-after-scale-out.outputs.result}}'
+                - name: nodes-count-after-scale-in
+                  value: '{{tasks.nodes-count-after-scale-in.outputs.result}}'
+
+          - name: benchmark-intermediate-verdict
+            dependencies: [ nodes-count-after-scale-in, benchmark ]
+            templateRef:
+              name: step3-templates
+              template: benchmark-reliability-verdict
+            arguments:
+              parameters:
+                - name: benchmark-result
+                  value: '{{tasks.benchmark.outputs.result}}'
+
+          - name: litmus-intermediate-verdict
+            dependencies: [ wait-pod-autoscaler ]
+            templateRef:
+              name: step1-templates
+              template: litmus-reliability-verdict
+            arguments:
+              parameters:
+                - name: experiment-id
+                  value: "{{workflow.parameters.litmus-experiment-id}}"
+
+          - name: overall-reliability-verdict
+            dependencies: [ benchmark-intermediate-verdict, litmus-intermediate-verdict, nodes-scaling-intermediate-verdict ]
+            templateRef:
+              name: step5-templates
+              template: composite-reliability-verdict
+            arguments:
+              parameters:
+                - name: upstream-verdicts
+                  value: '{{tasks.benchmark-intermediate-verdict.outputs.parameters.verdict}},{{tasks.litmus-intermediate-verdict.outputs.parameters.verdict}},{{tasks.nodes-scaling-intermediate-verdict.outputs.parameters.verdict}}'

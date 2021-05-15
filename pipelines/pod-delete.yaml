@@ -1,0 +1,81 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: wf-pd
+  namespace: litmus
+
+spec:
+  entrypoint: argowf-chaos
+  serviceAccountName: argo-chaos
+
+  arguments:
+    parameters:
+      - name: appNamespace
+        value: "apps"
+      - name: adminModeNamespace
+        value: "litmus"
+      - name: appLabel
+        value: "basic"
+
+      - name: chaos-duration
+        value: "32"
+
+      - name: litmus-experiment-id
+        value: "pod-del"
+
+  nodeSelector:
+    kubernetes.io/os: linux
+    role: "tools"
+
+  tolerations:
+    - key: tools
+      operator: "Equal"
+      value: "true"
+      effect: NoSchedule
+
+  templates:
+    - name: argowf-chaos
+      dag:
+        tasks:
+
+          # 1 pod delete: Continuous Test
+
+          - name: chaos-1-pod-delete
+            templateRef:
+              name: step1-templates
+              template: litmus-pod-delete
+            arguments:
+              parameters:
+                - name: chaos-duration
+                  value: "{{workflow.parameters.chaos-duration}}"
+                - name: chaos-interval
+                  value: "{{workflow.parameters.chaos-duration}}"
+                - name: pods-affected-perc
+                  value: "0" # corresponds to 1 replica
+                - name: probe-mode
+                  value: "Continuous"
+                - name: experiment-id
+                  value: "{{workflow.parameters.litmus-experiment-id}}"
+                - name: http-probe-url
+                  value: "http://{{workflow.parameters.appLabel}}.{{workflow.parameters.appNamespace}}.svc.cluster.local:8080/hello"
+
+          - name: wait-1-pod-delete
+            dependencies: [ chaos-1-pod-delete ]
+            templateRef:
+              name: step1-templates
+              template: await-litmus-result
+            arguments:
+              parameters:
+                - name: experiment-id
+                  value: "{{workflow.parameters.litmus-experiment-id}}"
+
+          - name: litmus-reliability-verdict
+            dependencies: [ wait-1-pod-delete ]
+            templateRef:
+              name: step1-templates
+              template: litmus-reliability-verdict
+            arguments:
+              parameters:
+                - name: experiment-id
+                  value: "{{workflow.parameters.litmus-experiment-id}}"
+

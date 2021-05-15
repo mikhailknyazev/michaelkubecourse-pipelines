@@ -1,0 +1,89 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: wf-spt-int
+  namespace: litmus
+spec:
+  entrypoint: argowf-chaos
+  serviceAccountName: argo-chaos
+  arguments:
+    parameters:
+      - name: appNamespace
+        value: "apps"
+      - name: adminModeNamespace
+        value: "litmus"
+      - name: appLabel
+        value: "basic"
+      - name: benchmark-duration
+        value: "10m"
+      - name: spot-node-unavailable-after-interruption-duration-sec
+        value: "180"
+
+  nodeSelector:
+    kubernetes.io/os: linux
+    role: "tools"
+
+  tolerations:
+    - key: tools
+      operator: "Equal"
+      value: "true"
+      effect: NoSchedule
+
+  templates:
+    - name: argowf-chaos
+      dag:
+        tasks:
+
+          - name: cluster-autoscaler-log-daemon
+            templateRef:
+              name: step5-templates
+              template: cluster-autoscaler-log-daemon
+
+          - name: get-ingress-alb-workload-url
+            templateRef:
+              name: step6-templates
+              template: get-ingress-alb-workload-url
+
+          - name: benchmark
+            dependencies: [ get-ingress-alb-workload-url ]
+            templateRef:
+              name: step3-templates
+              template: run-benchmark
+            arguments:
+              parameters:
+                - name: bench-duration
+                  value: "{{workflow.parameters.benchmark-duration}}"
+                - name: bench-rate
+                  value: "10"
+                - name: target-url
+                  value: "{{tasks.get-ingress-alb-workload-url.outputs.result}}/hello?myName=MichaelK"
+
+          # NOTE: This experiment takes roughly (5 minutes = 2 minutes + 180 seconds) to complete:
+          # - The 2 minutes are the standard AWS time between Spot Interruption notification gets issued and actual Interruption of the instance.
+          # - The 180 seconds are the configured below period this experiment makes the instance "unavailable" for the EKS Cluster
+          #   (via taint 'simulated-termination:NoExecute') to simulate the actual termination of the EC2 instance.
+          - name: ec2-spot-interruption-experiment
+            dependencies: [ get-ingress-alb-workload-url ]
+            templateRef:
+              name: step8-templates
+              template: ec2-spot-interruption-experiment
+            arguments:
+              parameters:
+                - name: "spot-node-unavailable-after-interruption-duration-sec"
+                  value: "{{workflow.parameters.spot-node-unavailable-after-interruption-duration-sec}}"
+
+          - name: await-simulated-spot-interruption
+            dependencies: [ get-ingress-alb-workload-url ]
+            templateRef:
+              name: step8-templates
+              template: await-simulated-spot-interruption
+
+          - name: benchmark-reliability-verdict
+            dependencies: [ await-simulated-spot-interruption, benchmark ]
+            templateRef:
+              name: step3-templates
+              template: benchmark-reliability-verdict
+            arguments:
+              parameters:
+                - name: benchmark-result
+                  value: '{{tasks.benchmark.outputs.result}}'

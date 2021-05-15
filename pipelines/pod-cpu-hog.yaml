@@ -1,0 +1,83 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: wf-hg
+  namespace: litmus
+spec:
+  entrypoint: argowf-chaos
+  serviceAccountName: argo-chaos
+  arguments:
+    parameters:
+      - name: appNamespace
+        value: "apps"
+      - name: adminModeNamespace
+        value: "litmus"
+      - name: appLabel
+        value: "basic"
+
+      - name: chaos-duration
+        value: "360" # 6 minutes
+
+      - name: check-all-running-after-sec-of-chaos
+        value: "300" # 5 minutes
+
+      - name: litmus-experiment-id
+        value: "strs"
+
+  nodeSelector:
+    kubernetes.io/os: linux
+    role: "tools"
+
+  tolerations:
+    - key: tools
+      operator: "Equal"
+      value: "true"
+      effect: NoSchedule
+
+  # Note: it is for Step 4 ("hpa enabled (no CA yet)")
+
+  templates:
+    - name: argowf-chaos
+      dag:
+        tasks:
+
+          # CPU stress on all the Pods: Continuous Test
+
+          - name: chaos-cpu-strs
+            templateRef:
+              name: step4-templates
+              template: litmus-cpu-hog
+            arguments:
+              parameters:
+                - name: chaos-duration
+                  value: "{{workflow.parameters.chaos-duration}}"
+                - name: check-all-running-after-sec-of-chaos
+                  value: "{{workflow.parameters.check-all-running-after-sec-of-chaos}}"
+                - name: http-probe-mode
+                  value: "Continuous"
+                - name: experiment-id
+                  value: "{{workflow.parameters.litmus-experiment-id}}"
+                - name: pods-affected-perc
+                  value: "100"
+                - name: http-probe-url
+                  value: "http://{{workflow.parameters.appLabel}}.{{workflow.parameters.appNamespace}}.svc.cluster.local:8080/hello"
+
+          - name: wait-cpu-strs
+            dependencies: [ chaos-cpu-strs ]
+            templateRef:
+              name: step1-templates
+              template: await-litmus-result
+            arguments:
+              parameters:
+                - name: experiment-id
+                  value: "{{workflow.parameters.litmus-experiment-id}}"
+
+          - name: litmus-reliability-verdict
+            dependencies: [ wait-cpu-strs ]
+            templateRef:
+              name: step1-templates
+              template: litmus-reliability-verdict
+            arguments:
+              parameters:
+                - name: experiment-id
+                  value: "{{workflow.parameters.litmus-experiment-id}}"

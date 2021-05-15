@@ -1,0 +1,92 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: wf-trm-eot
+  namespace: litmus
+spec:
+  entrypoint: argowf-chaos
+  serviceAccountName: argo-chaos
+  arguments:
+    parameters:
+      - name: appNamespace
+        value: "apps"
+      - name: adminModeNamespace
+        value: "litmus"
+      - name: appLabel
+        value: "basic"
+
+      - name: chaos-duration
+        value: "240"
+
+      - name: litmus-experiment-id
+        value: "ec-trm-eot"
+
+  nodeSelector:
+    kubernetes.io/os: linux
+    role: "tools"
+
+  tolerations:
+    - key: tools
+      operator: "Equal"
+      value: "true"
+      effect: NoSchedule
+
+  templates:
+    - name: argowf-chaos
+      dag:
+        tasks:
+
+          # We are querying the EC2 metadata service of the current Kubernetes node for the AWS Region name
+          - name: get-current-region
+            templateRef:
+              name: step2-templates
+              template: cmd
+            arguments:
+              parameters:
+                - name: cmd
+                  value: >-
+                    curl --silent http://169.254.169.254/latest/dynamic/instance-identity/document | jq -r .region
+
+          # 1 EC2 instance terminate (only one): EOT Test
+
+          - name: chaos-1-ec2-term-EOT
+            dependencies: [ get-current-region ]
+            templateRef:
+              name: step2-templates
+              template: litmus-terminate-ec2
+            arguments:
+              parameters:
+                - name: chaos-duration
+                  value: "{{workflow.parameters.chaos-duration}}"
+                - name: chaos-interval
+                  value: "{{workflow.parameters.chaos-duration}}"
+                - name: probe-mode
+                  value: "EOT"
+                - name: experiment-id
+                  value: "{{workflow.parameters.litmus-experiment-id}}"
+                - name: ec2-instance-tag
+                  value: "Name:kube-system-ec2-eks_asg"
+                - name: region
+                  value: "{{tasks.get-current-region.outputs.result}}"
+                - name: http-probe-url
+                  value: "http://{{workflow.parameters.appLabel}}.{{workflow.parameters.appNamespace}}.svc.cluster.local:8080/hello"
+
+          - name: wait-1-ec2-term-EOT
+            dependencies: [ chaos-1-ec2-term-EOT ]
+            templateRef:
+              name: step1-templates
+              template: await-litmus-result
+            arguments:
+              parameters:
+                - name: experiment-id
+                  value: "{{workflow.parameters.litmus-experiment-id}}"
+
+          - name: litmus-reliability-verdict
+            dependencies: [ wait-1-ec2-term-EOT ]
+            templateRef:
+              name: step1-templates
+              template: litmus-reliability-verdict
+            arguments:
+              parameters:
+                - name: experiment-id
+                  value: "{{workflow.parameters.litmus-experiment-id}}"
