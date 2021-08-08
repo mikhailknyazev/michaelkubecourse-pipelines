@@ -1,2 +1,2 @@
 # michaelkubecourse-pipelines
-Pipelines for course "Configuring Kubernetes for Reliability with LitmusChaos"
+Pipelines for Udemy course [Configuring Kubernetes for Reliability with LitmusChaos](https://www.udemy.com/course/configuring-kubernetes-for-reliability-with-litmuschaos/).
